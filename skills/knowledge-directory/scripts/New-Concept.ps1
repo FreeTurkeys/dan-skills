@@ -8,6 +8,10 @@
   found; unregistered types warn (governance says they must be registered
   before the agent finishes the capture).
 
+.PARAMETER VaultPath
+  Optional explicit Vault path (tests, second vaults). Normally resolved from
+  ~/.dan-skills/config.json via Resolve-VaultPath.ps1.
+
 .EXAMPLE
   pwsh -NoProfile -File New-Concept.ps1 -Path ~/OneDrive/agent-knowledge/2-Resources -Title "Pointer stability" -Type Idea
 #>
@@ -16,10 +20,17 @@ param(
     [Parameter(Mandatory)][string]$Path,      # the PARA dir (or topic subdir) it goes in
     [Parameter(Mandatory)][string]$Title,     # descriptive, kebab-case applied to filename
     [string]$Type = 'Idea',
-    [string]$VaultPath = $(if ($env:DANSKILLS_VAULT) { $env:DANSKILLS_VAULT } else { Join-Path $HOME 'OneDrive/agent-knowledge' })
+    [string]$VaultPath
 )
 
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'DanSkills.ps1')
+
+$VaultPath = Resolve-DanSkillsVault -VaultPath $VaultPath
+if (-not $VaultPath) {
+    Write-Error 'not configured: run Resolve-VaultPath.ps1 for the fix instructions (exit 2).'
+    exit 2
+}
 
 if (-not (Test-Path $Path)) { throw "-Path does not exist: $Path" }
 

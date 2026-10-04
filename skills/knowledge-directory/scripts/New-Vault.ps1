@@ -3,28 +3,41 @@
   Lay down the Vault skeleton (idempotent, no git — ADR-0002).
 
 .PARAMETER VaultPath
-  Target Vault directory. Overrides $env:DANSKILLS_VAULT.
+  Target Vault directory. Explicit path wins over ~/.dan-skills/config.json
+  (which this script writes when it creates a Vault). With neither, falls back
+  to the installer's default and says so.
 
 .EXAMPLE
   pwsh -NoProfile -File New-Vault.ps1
 #>
 [CmdletBinding()]
 param(
-    [string]$VaultPath = $(if ($env:DANSKILLS_VAULT) { $env:DANSKILLS_VAULT } else { Join-Path $HOME 'OneDrive/agent-knowledge' })
+    [string]$VaultPath
 )
 
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'DanSkills.ps1')
 
-if (Test-Path (Join-Path $VaultPath 'log.md')) {
-    Write-Host "Vault already exists at $VaultPath — nothing to bootstrap."
+$fromConfig = $false
+$resolved = Resolve-DanSkillsVault -VaultPath $VaultPath
+if ($resolved) {
+    $fromConfig = $true
+}
+else {
+    $resolved = Join-Path $HOME 'OneDrive' | Join-Path -ChildPath 'agent-knowledge'
+    Write-Warning "No vault configured — falling back to the installer default: $resolved"
+}
+
+if (Test-Path (Join-Path $resolved 'log.md')) {
+    Write-Host "Vault already exists at $resolved — nothing to bootstrap."
     exit 0
 }
 
-Write-Host "Bootstrapping Vault at $VaultPath"
-New-Item -ItemType Directory -Force -Path $VaultPath | Out-Null
+Write-Host "Bootstrapping Vault at $resolved"
+New-Item -ItemType Directory -Force -Path $resolved | Out-Null
 foreach ($container in '0-Projects', '1-Areas', '2-Resources', '3-Archives') {
-    New-Item -ItemType Directory -Force -Path (Join-Path $VaultPath $container) | Out-Null
-    $stub = Join-Path $VaultPath "$container/index.md"
+    New-Item -ItemType Directory -Force -Path (Join-Path $resolved $container) | Out-Null
+    $stub = Join-Path $resolved "$container/index.md"
     if (-not (Test-Path $stub)) {
         "# $($container -replace '^\d-','')`n`n- (no entries yet — ask the knowledge-directory skill to capture something)`n" |
             Set-Content -Path $stub -Encoding utf8NoBOM
@@ -32,7 +45,7 @@ foreach ($container in '0-Projects', '1-Areas', '2-Resources', '3-Archives') {
 }
 
 # Root index: the OKF version declaration lives here.
-$rootIndex = Join-Path $VaultPath 'index.md'
+$rootIndex = Join-Path $resolved 'index.md'
 if (-not (Test-Path $rootIndex)) {
     Set-Content -Path $rootIndex -Encoding utf8NoBOM -Value @'
 ---
@@ -51,7 +64,7 @@ okf_version: 0.2
 }
 
 # Update log: empty, dated headings newest-first when they appear.
-$log = Join-Path $VaultPath 'log.md'
+$log = Join-Path $resolved 'log.md'
 if (-not (Test-Path $log)) {
     Set-Content -Path $log -Encoding utf8NoBOM -Value @'
 # Update log
@@ -61,7 +74,7 @@ _(Agent sessions append `## YYYY-MM-DD` sections here, newest first.)_
 }
 
 # Root index: AGENTS.md — the thin agent pointer.
-$agents = Join-Path $VaultPath 'AGENTS.md'
+$agents = Join-Path $resolved 'AGENTS.md'
 if (-not (Test-Path $agents)) {
     Set-Content -Path $agents -Encoding utf8NoBOM -Value @'
 # Agent instructions — read llms.txt first
@@ -75,7 +88,7 @@ if (-not (Test-Path $agents)) {
 }
 
 # Type registry: seeded with the day-one vocabulary. Governance rules live in-repo.
-$vocab = Join-Path $VaultPath '2-Resources/vocabulary.md'
+$vocab = Join-Path $resolved '2-Resources/vocabulary.md'
 if (-not (Test-Path $vocab)) {
     Set-Content -Path $vocab -Encoding utf8NoBOM -Value @'
 ---
@@ -112,7 +125,7 @@ _(Consolidation reviews and de-registrations append dated lines here.)_
 }
 
 # Front door: placeholder until the first regeneration.
-$frontDoor = Join-Path $VaultPath 'llms.txt'
+$frontDoor = Join-Path $resolved 'llms.txt'
 if (-not (Test-Path $frontDoor)) {
     Set-Content -Path $frontDoor -Encoding utf8NoBOM -Value @'
 # Agent knowledge (personal vault)
@@ -123,6 +136,12 @@ if (-not (Test-Path $frontDoor)) {
 _This front door was bootstrapped with placeholder prose; the H2 file lists
 below regenerate via `scripts/Update-FrontDoor.ps1`._
 '@
+}
+
+# The Vault location is now a fact on disk for every script and session.
+if (-not $fromConfig) {
+    Set-DanSkillsConfig -Vault $resolved
+    Write-Host "Vault configured: $resolved"
 }
 
 Write-Host 'Vault skeleton ready. Done.'

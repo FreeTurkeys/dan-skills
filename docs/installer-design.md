@@ -87,3 +87,39 @@ Claude Code / Cursor; **Vault** = the OneDrive-synced knowledge directory.
 - **Q14 macOS without Homebrew**: error out with guidance; `.pkg` fallback deferred
 
 Implemented in root `install.ps1` (this call it is no longer a prototype skeleton — it is the candidate production script; ticket #8 proves it on macOS). Adapted from `prototype/installer/install.ps1` (commit 485e48d) on branch `prototype/installer`.
+
+## Addendum — state layer + drift engine (2026-10-03, ticket #3)
+
+Decided while building the skill. Canonical state lives in `~/.dan-skills/`:
+
+| File | Holds | Written by |
+| --- | --- | --- |
+| `config.json` | `{ "vault": "<abs path>" }` — the single key | installer, `New-Vault.ps1`, `Set-VaultConfig.ps1` |
+| `manifest.json` | `configVersion`, `installedAtRepo`, per-skill `{ installedAt, files: { relpath: sha256 } }` | installer only |
+| `backups/<ts>/<skill>/` | archived copies of locally modified skills — never pruned | installer |
+
+- **Vault path is a fact, not a guess** (Q22/Q25/Q32): precedence `-VaultPath` >
+  `config.json` > prompt (default `~/OneDrive/agent-knowledge`) > built-in default
+  under `-Defaults`/`-Force`. `Resolve-VaultPath.ps1` exits 2 with instructions
+  when unconfigured; the skill asks the user in chat and persists the answer.
+  The `DANSKILLS_VAULT` env var is retired.
+- **Two comparisons, one prompt** (Q27–Q30): installed-vs-manifest = *local drift*
+  (prompts); manifest-vs-repo = *version delta* (installs silently). Drift resolves
+  as `overwrite` / `backup` (default; archive then install fresh) / `merge`
+  (file-granular: repo-new lands, locally-modified kept, conflicts printed) /
+  `skip`.
+- **Hashes are content-normalized** (Q28): text via CRLF→LF before SHA-256, raw
+  bytes for binaries, so a Windows checkout never looks like a local edit.
+- **Non-interactive matrix** (Q30): no TTY + no switch = refuse loudly, exit
+  non-zero. `-Defaults` = unattended, config-or-default path, drift resolved by
+  backup (never overwrite). `-Force` = unattended overwrite, still backs up first.
+- **One bootstrap, one implementation**: the installer calls the skill's
+  `New-Vault.ps1` instead of keeping its own stub loop (which had drifted).
+- Uninstall is manifest-driven; legacy pre-manifest stamped copies are swept.
+
+Implementation: root `install.ps1` + `skills/knowledge-directory/scripts/DanSkills.ps1`
+(dot-sourced by both installer and skill — one hashing/config implementation).
+Smoke-tested on macOS under a sandboxed `HOME`: fresh install, clean re-run,
+CRLF normalization, all four drift answers, uninstall, re-install. **Untested:**
+the true no-TTY refusal path (macOS always reports `UserInteractive`), Windows
+PS 5.1 bootstrap, Linux packaging — per the parked-verification decision.

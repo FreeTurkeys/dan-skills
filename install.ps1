@@ -1,38 +1,52 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-    dan-skills Installer (PROTOTYPE SKELETON).
+    dan-skills Installer.
 
 .DESCRIPTION
     Installs Agent Skills from this repo: one real copy in the Agent skills
     home (~/.agents/skills), linked from the Skill home (~/.claude/skills).
-    Optionally bootstraps pwsh 7
-    if missing (Windows: winget -> MSI fallback; macOS: brew; Linux: apt/dnf),
-    and optionally lays down the Vault skeleton (no git inside the Vault —
-    ADR-0002).
+    Bootstraps pwsh 7 if missing (Windows: winget -> MSI fallback; macOS: brew;
+    Linux: apt/dnf), records a per-file hash manifest, and optionally lays down
+    the Vault skeleton (no git inside the Vault — ADR-0002).
 
-    Must be runnable under Windows PowerShell 5.1 / cmd.exe so it can
-    bootstrap pwsh 7 itself. Use only PS5.1-compatible syntax in this file.
+    Must be runnable under Windows PowerShell 5.1 / cmd.exe so it can bootstrap
+    pwsh 7 itself. Use only PS5.1-compatible syntax in this file.
+
+    Local edits are never destroyed silently. Re-running over a skill whose
+    installed files no longer match ~/.dan-skills/manifest.json is "drift";
+    drift is offered as overwrite / backup / merge / skip (or decided by
+    -Force / -Defaults). Everything that is overwritten or merged is first
+    copied to ~/.dan-skills/backups/<timestamp>/, which is never pruned.
 
 .PARAMETER VaultPath
-    Target Vault directory. Default: ~/OneDrive/agent-knowledge, overridable
-    via env DANSKILLS_VAULT. The path is whatever you want it to be — the
-    script verifies it exists/creates it, and does not care what sync system
-    (if any) owns it.
+    Explicit Vault directory. Beats ~/.dan-skills/config.json. Prompted for
+    when neither exists (unless -Defaults). The path is whatever you want it
+    to be — the script does not care what sync system (if any) owns it.
 
 .PARAMETER Tools
     Hosting tools covered, via the linked-copy architecture: real copies in
     ~/.agents/skills (read by OpenCode and Cursor), junction/symlinked into
     ~/.claude/skills (read by Claude Code).
 
+.PARAMETER Defaults
+    Unattended install using stored config or the default Vault path. Drift is
+    resolved by backup (never overwrite). For bootstrap scripts and CI.
+
+.PARAMETER Force
+    Unattended install that overwrites drifted skills, discarding local edits
+    (a copy still lands in backups/ first). Use knowingly.
+
 .PARAMETER Uninstall
-    Removes previously installed Skills (matched by version stamp).
+    Removes the skills recorded in the manifest. Never touches pwsh or the
+    Vault.
 
 .PARAMETER DryRun
     Print what would happen; change nothing.
 
 .EXAMPLE
-    powershell -File install.ps1            # from cmd.exe, bootstraps pwsh
+    powershell -File install.ps1                # from cmd.exe, bootstraps pwsh
+    pwsh -File install.ps1 -Defaults            # unattended, non-destructive
     pwsh -File install.ps1 -DryRun
 #>
 [CmdletBinding()]
@@ -40,6 +54,8 @@ param(
     [string]$VaultPath,
     [ValidateSet('all')]
     [string]$Tools = 'all',
+    [switch]$Defaults,
+    [switch]$Force,
     [switch]$Uninstall,
     [switch]$DryRun
 )
@@ -51,8 +67,14 @@ $RepoRoot       = $PSScriptRoot
 $SkillsSource   = Join-Path $RepoRoot 'skills'          # skills live in-repo
 $SkillHome      = Join-Path $HOME '.claude' | Join-Path -ChildPath 'skills'
 $AgentsHome     = Join-Path $HOME '.agents' | Join-Path -ChildPath 'skills'
-$VersionStampFile = '.dan-skills.version'               # idempotency stamp
 $MinPwshMajor   = 7
+$DefaultVault   = Join-Path (Join-Path $HOME 'OneDrive') 'agent-knowledge'
+
+# Shared state layer (config.json, manifest.json, hashing) lives with the
+# skill so installed copies and the Installer can never disagree.
+$LibraryPath = Join-Path $SkillsSource 'knowledge-directory/scripts/DanSkills.ps1'
+if (-not (Test-Path $LibraryPath)) { throw "Shared library missing: $LibraryPath" }
+. $LibraryPath
 
 # --- Helpers -----------------------------------------------------------------
 function Test-PwshAvailable {
@@ -66,6 +88,22 @@ function Get-PwshVersion {
     param()
     $v = & pwsh -NoProfile -Command '$PSVersionTable.PSVersion.Major'
     return [int]$v
+}
+
+function Test-Interactive {
+    [CmdletBinding()]
+    param()
+    if ($Defaults -or $Force) { return $false }
+    return [bool][Environment]::UserInteractive -and [bool]$Host.Name
+}
+
+function Read-InteractiveChoice {
+    <# Read-Host with a default; returns the default on empty input. #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Prompt, [string]$Default)
+    $answer = Read-Host "$Prompt [$Default]"
+    if ([string]::IsNullOrWhiteSpace($answer)) { return $Default }
+    return $answer.Trim()
 }
 
 # --- Bootstrap: pwsh 7 missing ------------------------------------------------
@@ -164,13 +202,94 @@ function Invoke-RelaunchUnderPwsh {
     throw 'pwsh installed but not found; open a new shell and re-run install.ps1.'
 }
 
-# --- Skill install (linked-copy architecture) ------------------------------------
+# --- Skill install (linked-copy + manifest drift engine) -------------------------
 # Ruling (#4, Q13): ONE real copy per skill lives in the Agent skills home
 # (~/.agents/skills); the Skill home (~/.claude/skills) gets a link per skill.
 # Windows: junctions (no elevation needed). macOS/Linux: symbolic links.
 # Foreign directories in either home are never touched.
+#
+# Drift engine (rulings Q27-Q31): ~/.dan-skills/manifest.json records the hash
+# of every file we wrote. On re-install, installed-vs-manifest decides clean or
+# drifted; drift is resolved by overwrite / backup / merge / skip, or decided
+# by -Force (overwrite) / -Defaults (backup). Backups are never pruned.
 
-function Copy-Skills {
+function Backup-Skill {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Dest, [Parameter(Mandatory)][string]$Stamp)
+    $backupsRoot = Join-Path (Get-DanSkillsStateDir) 'backups'
+    $target = Join-Path (Join-Path $backupsRoot $Stamp) (Split-Path $Dest -Leaf)
+    # Two drift events in the same second must not share a folder (silent merge).
+    $n = 2
+    while (Test-Path $target) { $target = Join-Path (Join-Path $backupsRoot $Stamp) "$((Split-Path $Dest -Leaf))-$n"; $n++ }
+    New-Item -ItemType Directory -Force -Path $backupsRoot | Out-Null
+    Copy-Item -Path $Dest -Destination $target -Recurse -Force
+    return $target
+}
+
+function Resolve-Drift {
+    <# Returns 'overwrite' | 'backup' | 'merge' | 'skip' for a drifted skill. #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Name)
+
+    if ($Force)    { return 'overwrite' }
+    if ($Defaults) { return 'backup' }
+    if (-not (Test-Interactive)) {
+        throw "Skill '$Name' has local modifications and there is no terminal to ask (exit $LASTEXITCODE). Re-run with -Defaults (backs up, keeps your edits in backups/) or -Force (overwrites, still backs up first)."
+    }
+    Write-Host ''
+    Write-Host "Skill '$Name' differs from what was installed (local edits?)."
+    Write-Host '  [1] overwrite  — install fresh; your version goes to backups/ first'
+    Write-Host '  [2] backup      — archive your version, install fresh (default)'
+    Write-Host '  [3] merge       — take new repo files, keep your modified files'
+    Write-Host '  [4] skip        — leave this skill exactly as it is'
+    $choice = Read-InteractiveChoice -Prompt 'Choose 1-4' -Default '2'
+    switch ($choice) {
+        '1' { return 'overwrite' }
+        '3' { return 'merge' }
+        '4' { return 'skip' }
+        default { return 'backup' }
+    }
+}
+
+function Install-SkillTree {
+    <# Write the repo skill over $Dest, honoring $Action (overwrite|merge).
+       For merge: repo files land unless they exist in $Dest and the manifest
+       flagged them modified; locally modified files are kept and reported. #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Source,
+        [Parameter(Mandatory)][string]$Dest,
+        [Parameter(Mandatory)][ValidateSet('overwrite', 'merge')][string]$Action,
+        $ManifestFiles = $null
+    )
+
+    if ($Action -eq 'overwrite') {
+        Remove-Item $Dest -Recurse -Force
+        New-Item -ItemType Directory -Force -Path $Dest | Out-Null
+        Copy-Item -Path (Join-Path $Source '*') -Destination $Dest -Recurse -Force
+        return @()
+    }
+
+    # merge: copy repo files that are new or were unmodified locally
+    $kept = @()
+    foreach ($f in Get-ChildItem $Source -Recurse -File) {
+        $rel = $f.FullName.Substring($Source.Length).TrimStart('/', '\')
+        $target = Join-Path $Dest $rel
+        $locallyModified = $false
+        if ($ManifestFiles -and $ManifestFiles.PSObject.Properties[$rel] -and (Test-Path $target)) {
+            $locallyModified = (Get-DanSkillsFileHash -Path $target) -ne $ManifestFiles.$rel
+        }
+        if ($locallyModified -and (Test-Path $target)) {
+            $kept += $rel
+            continue
+        }
+        New-Item -ItemType Directory -Force -Path (Split-Path $target -Parent) | Out-Null
+        Copy-Item -Path $f.FullName -Destination $target -Force
+    }
+    return $kept
+}
+
+function Install-Skills {
     [CmdletBinding()]
     param()
 
@@ -178,50 +297,105 @@ function Copy-Skills {
         throw "No skills/ directory at $SkillsSource — nothing to install."
     }
 
+    $manifest = Get-DanSkillsManifest
+    if (-not $manifest) {
+        $manifest = [pscustomobject]@{ configVersion = 1; installedAtRepo = $null; skills = [pscustomobject]@{} }
+    }
+
     New-Item -ItemType Directory -Force -Path $AgentsHome | Out-Null
     foreach ($skillDir in Get-ChildItem $SkillsSource -Directory) {
-        $dest = Join-Path $AgentsHome $skillDir.Name
-        if ($DryRun) { Write-Host "[DryRun] copy $($skillDir.FullName) -> $dest"; continue }
-        # Idempotent overwrite: remove only OUR stamped installs.
-        if (Test-Path $dest) {
-            if (Test-Path (Join-Path $dest $VersionStampFile)) {
-                Remove-Item $dest -Recurse -Force
-            } else {
-                Write-Warning "Skip $dest — exists and is not dan-skills-managed."
-                continue
+        $name = $skillDir.Name
+        $dest = Join-Path $AgentsHome $name
+        $record = $manifest.skills.PSObject.Properties[$name]
+        $expected = if ($record) { $record.Value.files } else { $null }
+        $installed = Test-Path $dest
+
+        # Foreign directory we do not own: leave it be (unless it is a stale
+        # copy of ours from a pre-manifest install, which has the old stamp).
+        if ($installed -and -not $expected -and -not (Test-Path (Join-Path $dest '.dan-skills.version'))) {
+            Write-Warning "Skip $dest — exists and is not dan-skills-managed."
+            continue
+        }
+
+        $action = 'overwrite'
+        if ($installed -and $expected) {
+            $diff = Compare-DanSkillsTree -Path $dest -Expected $expected
+            if ($diff.Status -eq 'clean') {
+                Write-Host "Skill '$name' is unchanged — refreshing to the current repo version."
+            }
+            else {
+                $stamp = (Get-Date).ToString('yyyyMMdd-HHmmss')
+                if ($DryRun) {
+                    Write-Host "[DryRun] $name drifted (+$($diff.Added.Count) ~$($diff.Modified.Count) -$($diff.Removed.Count)); would prompt/resolve, back up to backups/$stamp"
+                    continue
+                }
+                Write-Host "Skill '$name' drifted (+$($diff.Added.Count) new, ~$($diff.Modified.Count) modified, -$($diff.Removed.Count) removed)."
+                $action = Resolve-Drift -Name $name
+                if ($action -eq 'skip') {
+                    Write-Host "  -> skipped '$name'; left as-is."
+                    continue
+                }
+                $backupPath = Backup-Skill -Dest $dest -Stamp $stamp
+                Write-Host "  -> backed up to $backupPath"
             }
         }
-        Copy-Item $skillDir.FullName $dest -Recurse
-        # Version stamp: lets -Uninstall target only our skills and lets a
-        # future update check know it installed an older build.
-        Set-Content -Path (Join-Path $dest $VersionStampFile) `
-            -Value ("dan-skills " + (Get-Date -Format o) + " / repo " + (git -C $RepoRoot rev-parse --short HEAD 2>$null))
+
+        if ($DryRun) { Write-Host "[DryRun] install $name -> $dest ($action)"; continue }
+
+        $kept = @()
+        if ($installed) {
+            # 'backup' and 'overwrite' differ only in that backup already
+            # archived the old tree; both then install fresh.
+            $treeAction = if ($action -eq 'merge') { 'merge' } else { 'overwrite' }
+            $kept = Install-SkillTree -Source $skillDir.FullName -Dest $dest -Action $treeAction -ManifestFiles $expected
+        }
+        else {
+            New-Item -ItemType Directory -Force -Path $dest | Out-Null
+            Copy-Item -Path (Join-Path $skillDir.FullName '*') -Destination $dest -Recurse -Force
+        }
+        if ($kept.Count) {
+            Write-Host "  -> merge kept your modified files: $($kept -join ', ')"
+        }
+
+        $manifest.skills | Add-Member -NotePropertyName $name -NotePropertyValue ([pscustomobject]@{
+            installedAt = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+            files        = (Get-DanSkillsTreeHash -Path $dest)
+        }) -Force
     }
-    Write-Host "Installed skills (real copies) -> $AgentsHome"
+
+    $repoSha = git -C $RepoRoot rev-parse --short HEAD 2>$null
+    $manifest.installedAtRepo = $repoSha
+    if (-not $DryRun) { Set-DanSkillsManifest -Manifest $manifest }
+    Write-Host "Skills installed (real copies) -> $AgentsHome"
     Link-Skills
 }
 
-# Link each of OUR skills from the Skill home; convert stale stamped
-# dual-copy installs to links; never touch foreign directories.
+# Link each of OUR skills from the Skill home; never touch foreign directories.
 function Link-Skills {
     [CmdletBinding()]
     param()
 
+    $manifest = Get-DanSkillsManifest
+    $ourNames = if ($manifest) { @($manifest.skills.PSObject.Properties.Name) }
+                else { @(Get-ChildItem $SkillsSource -Directory -ErrorAction SilentlyContinue | ForEach-Object Name) }
+
     New-Item -ItemType Directory -Force -Path $SkillHome | Out-Null
-    foreach ($realDir in Get-ChildItem $AgentsHome -Directory -ErrorAction SilentlyContinue) {
-        $target = Join-Path $SkillHome $realDir.Name
-        if ($DryRun) { Write-Host "[DryRun] link $target -> $($realDir.FullName)"; continue }
+    foreach ($name in $ourNames) {
+        $real = Join-Path $AgentsHome $name
+        if (-not (Test-Path $real)) { continue }
+        $target = Join-Path $SkillHome $name
+        if ($DryRun) { Write-Host "[DryRun] link $target -> $real"; continue }
         if (Test-Path $target) {
             if ((Get-Item $target).LinkType) { Remove-Item $target -Force }          # relink ours
-            elseif (Test-Path (Join-Path $target $VersionStampFile)) {
+            elseif (Test-Path (Join-Path $target '.dan-skills.version')) {
                 Remove-Item $target -Recurse -Force                                  # old dual-copy install
             }
             else { Write-Warning "Skip linking $target — exists and is not ours."; continue }
         }
         if ($IsWindows -or $env:OS -eq 'Windows_NT') {
-            New-Item -ItemType Junction -Path $target -Target $($realDir.FullName) | Out-Null
+            New-Item -ItemType Junction -Path $target -Target $real | Out-Null
         } else {
-            New-Item -ItemType SymbolicLink -Path $target -Target $($realDir.FullName) | Out-Null
+            New-Item -ItemType SymbolicLink -Path $target -Target $real | Out-Null
         }
     }
     Write-Host "Linked skills -> $SkillHome"
@@ -231,76 +405,90 @@ function Remove-Skills {
     [CmdletBinding()]
     param()
 
-    # Real copies in the Agent skills home: stamped ones only.
-    Get-ChildItem $AgentsHome -Directory -ErrorAction SilentlyContinue |
-        Where-Object { Test-Path (Join-Path $_.FullName $VersionStampFile) } |
-        ForEach-Object {
-            if ($DryRun) { Write-Host "[DryRun] would remove $($_.FullName)" }
-            else { Remove-Item $_.FullName -Recurse -Force; Write-Host "Removed $($_.FullName)" }
-        }
+    # The manifest is the record of what we installed. Real copies in the
+    # Agent skills home that it names are ours; anything else is not.
+    $manifest = Get-DanSkillsManifest
+    $ourNames = if ($manifest) { @($manifest.skills.PSObject.Properties.Name) }
+                else { @() }
 
-    # Skill home: our per-skill links and stamped dual-copy leftovers.
-    $ourNames = @(Get-ChildItem $SkillsSource -Directory -ErrorAction SilentlyContinue |
-        ForEach-Object Name)
-    Get-ChildItem $SkillHome -ErrorAction SilentlyContinue |
-        Where-Object {
-            (($_.LinkType) -and ($ourNames -contains $_.Name)) -or
-            (Test-Path (Join-Path $_.FullName $VersionStampFile))
-        } |
-        ForEach-Object {
-            if ($DryRun) { Write-Host "[DryRun] would remove $($_.FullName)" }
-            else { Remove-Item $_.FullName -Recurse -Force; Write-Host "Removed $($_.FullName)" }
+    foreach ($name in $ourNames) {
+        $realCopy = Join-Path $AgentsHome $name
+        $link = Join-Path $SkillHome $name
+        foreach ($target in @($realCopy, $link)) {
+            if (-not (Test-Path $target)) { continue }
+            if ($DryRun) { Write-Host "[DryRun] would remove $target" }
+            else { Remove-Item $target -Recurse -Force; Write-Host "Removed $target" }
         }
+    }
+
+    # Legacy pre-manifest dual-copy installs (stamped, not in the manifest).
+    if ($SkillsSource -and (Test-Path $SkillsSource)) {
+        $legacy = @(Get-ChildItem $SkillHome -Directory -ErrorAction SilentlyContinue |
+            Where-Object { (Test-Path (Join-Path $_.FullName '.dan-skills.version')) -and ($ourNames -notcontains $_.Name) })
+        foreach ($dir in $legacy) {
+            if ($DryRun) { Write-Host "[DryRun] would remove legacy stamped copy $($dir.FullName)" }
+            else { Remove-Item $dir.FullName -Recurse -Force; Write-Host "Removed legacy stamped copy $($dir.FullName)" }
+        }
+    }
+
+    if (-not $DryRun -and $manifest) { Set-DanSkillsManifest -Manifest ([pscustomobject]@{ configVersion = 1; installedAtRepo = $null; skills = [pscustomobject]@{} }) }
 
     Write-Host 'Uninstall (-Uninstall) never touches pwsh or the Vault.'
 }
 
 # --- Vault bootstrap (optional) --------------------------------------------------
-function Initialize-Vault {
+function Resolve-VaultTarget {
+    <# explicit -VaultPath > config.json > prompt (default shown) > $DefaultVault
+       (only under -Defaults/-Force). Returns $null when it cannot be settled. #>
     [CmdletBinding()]
     param()
-
-    if (-not $VaultPath) {
-        # LocalAppData is not visible inside *this* PS5.1 simulator; use default.
-        $VaultPath = if ($env:DANSKILLS_VAULT) { $env:DANSKILLS_VAULT }
-                     else { Join-Path $HOME 'OneDrive' | Join-Path -ChildPath 'agent-knowledge' }
+    if ($VaultPath) { return $VaultPath }
+    $config = Get-DanSkillsConfig
+    if ($config -and $config.vault) { return $config.vault }
+    if ($Defaults -or $Force) { return $DefaultVault }
+    if (-not (Test-Interactive)) {
+        Write-Error 'No vault configured and no terminal to ask. Re-run with -VaultPath <path> or -Defaults.'
+        return $null
     }
+    return (Read-InteractiveChoice -Prompt 'Vault path' -Default $DefaultVault)
+}
 
-    if (Test-Path (Join-Path $VaultPath 'llms.txt')) {
-        Write-Host "Vault already initialized at $VaultPath — skipping."
+function Initialize-Vault {
+    [CmdletBinding()]
+    param([string]$Target)
+
+    if (-not $Target) { return }
+    if (Test-Path (Join-Path $Target 'llms.txt')) {
+        Write-Host "Vault already initialized at $Target — skipping."
         return
     }
 
-    $answer = Read-Host "Bootstrap Vault skeleton at '$VaultPath'? [y/N]"
-    if ($answer -notmatch '^[Yy]') { Write-Host 'Skipping Vault bootstrap.'; return }
-
-    if ($DryRun) { Write-Host "[DryRun] would lay Vault skeleton at $VaultPath"; return }
-
-    # Validated template shape from prototype/vault-template (do NOT copy the
-    # branch wholesale — minimal skeleton only, content authored in-repo):
-    $skeleton = @(
-        '0-Projects', '1-Areas', '2-Resources', '3-Archives',
-        'llms.txt', 'log.md', 'index.md', 'AGENTS.md'
-    )
-    New-Item -ItemType Directory -Force -Path $VaultPath | Out-Null
-    foreach ($s in $skeleton) {
-        $p = Join-Path $VaultPath $s
-        if ($s -match '^[0-3]-') {   # PARA containers need their own index.md
-            New-Item -ItemType Directory -Force -Path $p | Out-Null
-            Set-Content -Path (Join-Path $p 'index.md') "# $s`n"   # stub; real copy deferred
+    # Vault location is a fact on disk for every later session (Q25/Q26).
+    $exists = Test-Path $Target
+    if (-not $Defaults -and -not $Force -and (Test-Interactive)) {
+        if ($exists) {
+            $answer = Read-InteractiveChoice -Prompt "No Vault skeleton at '$Target' yet. Bootstrap it there? [y/N]" -Default 'N'
         }
-        elseif (-not (Test-Path $p)) {
-            switch ([IO.Path]::GetExtension($s)) {
-                '.txt' { New-Item -ItemType File -Path $p | Out-Null }      # llms.txt authored in-repo
-                '.md'  { New-Item -ItemType File -Path $p | Out-Null }
-                default { New-Item -ItemType File -Path $p | Out-Null }     # AGENTS.md
-            }
+        else {
+            $answer = Read-InteractiveChoice -Prompt "Bootstrap Vault skeleton at '$Target'? [y/N]" -Default 'N'
         }
+        if ($answer -notmatch '^[Yy]') { Write-Host 'Skipping Vault bootstrap.'; return }
     }
-    # ADR-0002: deliberately NO `git init` here — OneDrive is the history.
-    Write-Host "Vault skeleton laid at $VaultPath (no git, per ADR-0002)."
-    Write-Host 'NOTE: llms.txt / index.md stubs are empty in this prototype;'
-    Write-Host '      real copies come from the vault-template branch.'
+    elseif (-not $exists -and -not $Defaults -and -not $Force) {
+        Write-Host "No Vault at $Target and unattended — skipping bootstrap."
+        return
+    }
+
+    if ($DryRun) { Write-Host "[DryRun] would lay Vault skeleton at $Target"; return }
+
+    # One bootstrap, one implementation: the skill's own New-Vault.ps1 (the
+    # installer used to keep its own stub loop, which drifted from it).
+    $newVault = [IO.Path]::GetFullPath((Join-Path (Split-Path $LibraryPath -Parent) 'New-Vault.ps1'))
+    & pwsh -NoProfile -File $newVault -VaultPath $Target
+    if ($LASTEXITCODE -ne 0) { throw "New-Vault.ps1 failed (exit $LASTEXITCODE)" }
+    Set-DanSkillsConfig -Vault $Target
+    # ADR-0002: New-Vault deliberately does NOT `git init` — OneDrive is history.
+    Write-Host "Vault skeleton laid at $Target (no git, per ADR-0002); path stored in $(Get-DanSkillsConfigPath)."
 }
 
 # --- Main -------------------------------------------------------------------------
@@ -319,6 +507,7 @@ if ($Uninstall) {
     exit 0
 }
 
-Copy-Skills
-Initialize-Vault
+Install-Skills
+$vaultTarget = Resolve-VaultTarget
+if ($vaultTarget) { Initialize-Vault -Target $vaultTarget }
 Write-Host 'Done.'

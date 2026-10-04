@@ -13,13 +13,23 @@
 #>
 [CmdletBinding()]
 param(
-    [string]$VaultPath = $(if ($env:DANSKILLS_VAULT) { $env:DANSKILLS_VAULT } else { Join-Path $HOME 'OneDrive/agent-knowledge' }),
+    [string]$VaultPath,
     [switch]$Quiet   # errors/warnings only
 )
 
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'DanSkills.ps1')
+
 $script:errors = 0; $script:warnings = 0
-$vaultRoot = (Get-Item $VaultPath).FullName.TrimEnd('/', '\')
+$vaultRoot = $VaultPath
+if (-not $vaultRoot) {
+    $vaultRoot = Resolve-DanSkillsVault
+    if (-not $vaultRoot) {
+        Write-Error 'not configured: run Resolve-VaultPath.ps1 for the fix instructions (exit 2).'
+        exit 2
+    }
+}
+$vaultRoot = (Get-Item $vaultRoot).FullName.TrimEnd('/', '\')
 function Note([string]$severity, [string]$message) {
     if ($severity -eq 'ERROR') { $script:errors++ } elseif ($severity -eq 'WARN') { $script:warnings++ }
     if (-not ($Quiet -and $severity -eq 'INFO')) { "{0,-5} {1}" -f $severity, $message }
@@ -31,7 +41,7 @@ function Is-Reserved([System.IO.FileInfo]$f) {
 
 ### 1. Concept rules: frontmatter + non-empty type
 $inUseTypes = @{}
-foreach ($md in Get-ChildItem $VaultPath -Recurse -Filter *.md) {
+foreach ($md in Get-ChildItem $vaultRoot -Recurse -Filter *.md) {
     if (Is-Reserved $md) { continue }
     $rel = $md.FullName.Substring($vaultRoot.Length).TrimStart('/', '\')
     $raw = Get-Content $md.FullName -Raw
@@ -61,7 +71,7 @@ foreach ($md in Get-ChildItem $VaultPath -Recurse -Filter *.md) {
 }
 
 ### 2. Registry checks
-$registry = Join-Path $VaultPath '2-Resources/vocabulary.md'
+$registry = Join-Path $vaultRoot '2-Resources/vocabulary.md'
 if (Test-Path $registry) {
     $rows = Get-Content $registry | Select-String -Pattern '^\|\s*`([^`]+)`\s*\|\s*(\S.*?)\s*\|'
     $seen = @{}
@@ -91,7 +101,7 @@ if (Test-Path $registry) {
 }
 
 ### 3. log.md ordering (reserved-file structure)
-$logFile = Join-Path $VaultPath 'log.md'
+$logFile = Join-Path $vaultRoot 'log.md'
 if (Test-Path $logFile) {
     $dates = Get-Content $logFile | Select-String '^(?:## |- )(\d{4}-\d{2}-\d{2})' |
         ForEach-Object { $_.Matches[0].Groups[1].Value }

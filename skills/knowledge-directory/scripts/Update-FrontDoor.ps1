@@ -9,27 +9,52 @@
   Notes), Conventions, Optional (Type registry + computed type-audit line).
   The audit line reads the registry's audit log for the last dated entry;
   due = +90 days.
+.PARAMETER VaultPath
+  Optional explicit Vault path. Normally resolved from
+  ~/.dan-skills/config.json via Resolve-VaultPath.ps1.
 #>
 [CmdletBinding()]
 param(
-    [string]$VaultPath = $(if ($env:DANSKILLS_VAULT) { $env:DANSKILLS_VAULT } else { Join-Path $HOME 'OneDrive/agent-knowledge' })
+    [string]$VaultPath
 )
 
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'DanSkills.ps1')
 
-if (-not (Test-Path (Join-Path $VaultPath 'llms.txt'))) {
-    throw "No llms.txt at $VaultPath — bootstrap first (New-Vault.ps1)."
+$vaultRoot = $VaultPath
+if (-not $vaultRoot) {
+    $vaultRoot = Resolve-DanSkillsVault
+    if (-not $vaultRoot) {
+        Write-Error 'not configured: run Resolve-VaultPath.ps1 for the fix instructions (exit 2).'
+        exit 2
+    }
 }
 
-$vaultRoot = (Get-Item $VaultPath).FullName.TrimEnd('/', '\')
+$frontDoorPath = Join-Path $vaultRoot 'llms.txt'
+if (-not (Test-Path $frontDoorPath)) {
+    throw "No llms.txt at $vaultRoot — bootstrap first (New-Vault.ps1)."
+}
+
+$vaultRoot = (Get-Item $vaultRoot).FullName.TrimEnd('/', '\')
 
 ### 1. Preserve agent-owned prose (everything before the first `## `)
-$existing = Get-Content (Join-Path $VaultPath 'llms.txt') -Raw
-$proseEnd = $existing.IndexOf("`n## ")
-$prose = if ($proseEnd -lt 0) { $existing.TrimEnd() } else { $existing.Substring(0, $proseEnd).TrimEnd() }
+$existing = Get-Content $frontDoorPath -Raw
+$proseEnd = if ($existing) { $existing.IndexOf("`n## ") } else { -1 }
+$prose = if (-not $existing) {
+    # Empty or prose-less front door (installer stub): write a minimal H1 and
+    # blockquote; the agent owns the wording from here on.
+    @"
+# Agent knowledge (personal vault)
+
+> Dan's synced personal vault of atomic notes — Projects, Areas, Resources,
+> Archives — in OKF format, maintained by the knowledge-directory skill.
+"@
+}
+elseif ($proseEnd -lt 0) { $existing.TrimEnd() }
+else { $existing.Substring(0, $proseEnd).TrimEnd() }
 
 ### 2. Discover Structure Notes (type: Structure Note) outside reserved index files
-$structureNotes = foreach ($md in Get-ChildItem $VaultPath -Recurse -Filter *.md) {
+$structureNotes = foreach ($md in Get-ChildItem $vaultRoot -Recurse -Filter *.md) {
     if ($md.Name -eq 'index.md') { continue }
     if ($md.Name -eq 'vocabulary.md' -and $md.DirectoryName -eq (Join-Path $vaultRoot '2-Resources')) { continue }
     $content = Get-Content $md.FullName -Raw
@@ -38,8 +63,8 @@ $structureNotes = foreach ($md in Get-ChildItem $VaultPath -Recurse -Filter *.md
 
 ### 3. Compute the audit-due line from the registry's audit log
 $auditLine = '- [Type registry](2-Resources/vocabulary.md): the governed `type` vocabulary; _no audit recorded yet — run `Test-Vault.ps1`_'
-if (Test-Path (Join-Path $VaultPath '2-Resources/vocabulary.md')) {
-    $lastAudit = Get-Content (Join-Path $VaultPath '2-Resources/vocabulary.md') |
+if (Test-Path (Join-Path $vaultRoot '2-Resources/vocabulary.md')) {
+    $lastAudit = Get-Content (Join-Path $vaultRoot '2-Resources/vocabulary.md') |
         Select-String -Pattern '^- (\d{4}-\d{2}-\d{2})' | Select-Object -Last 1
     if ($lastAudit) {
         $when = [datetime]::ParseExact($lastAudit.Matches[0].Groups[1].Value, 'yyyy-MM-dd', $null)
@@ -49,7 +74,7 @@ if (Test-Path (Join-Path $VaultPath '2-Resources/vocabulary.md')) {
 }
 
 ### 4. Emit front door
-$frontdoor = @"
+$frontDoorContent = @"
 $prose
 
 ## Start here
@@ -77,5 +102,5 @@ $prose
 
 $auditLine
 "@
-Set-Content -Path (Join-Path $VaultPath 'llms.txt') -Encoding utf8NoBOM -Value $frontdoor
-Write-Host "Front door regenerated: $(Join-Path $VaultPath 'llms.txt') ($($structureNotes.Count) structure notes listed)"
+Set-Content -Path $frontDoorPath -Encoding utf8NoBOM -Value $frontDoorContent
+Write-Host "Front door regenerated: $frontDoorPath ($($structureNotes.Count) structure notes listed)"
