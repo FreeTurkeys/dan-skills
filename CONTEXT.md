@@ -30,9 +30,17 @@ quotes, but Vault is our word)
 One markdown note in the Vault: frontmatter with required `type`, optional
 recommended fields, free-form body (per OKF).
 
-**Zettel ID**:
-The unique address of a Concept, a timestamp string (per Zettelkasten),
-recorded in frontmatter `id` and/or filename prefix.
+**Idea**:
+Our atomic-note `type` — one idea, one Concept, stated in our own (or the
+agent's distilled) words. The default Concept type; governed in the
+Vault's Type registry.
+_Avoid_: zettel
+
+**Note ID**:
+The Concept's permanent unique address: a timestamp string in frontmatter
+`id` (e.g. `"202610030910"`). Filenames stay clean and descriptive; notes may
+rename without breaking their address. Derived from Zettelkasten's address rule.
+_Avoid_: zettel ID, slug
 
 **Structure note**:
 An `index.md` that orders Concepts on a topic — OKF's per-directory listing

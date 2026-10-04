@@ -1,4 +1,10 @@
+---
+status: superseded by ADR-0002
+---
+
 # The Vault lives in OneDrive, with local-only git history
+
+_**Superseded:** git was removed from the Vault; see ADR-0002._
 
 The Vault syncs across devices via OneDrive (user's existing sync), not via a
 GitHub remote: a `~/OneDrive/agent-knowledge` per OS. Inside the Vault is a git
