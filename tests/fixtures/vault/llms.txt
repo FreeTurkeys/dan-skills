@@ -1,0 +1,25 @@
+# Agent Knowledge (personal vault)
+
+> Dan's synced personal vault of atomic notes — Projects, Areas, Resources, Archives — in OKF format, maintained by the `knowledge-directory` skill. Concepts carry frontmatter `type` from the governed vocabulary: `Idea`, `Project Note`, `Area Note`, `Literature Note`, `Structure Note`. Every Concept has a frontmatter `id` (timestamp, uniquely addressing it forever).
+
+Read `[llms.txt](llms.txt)` first — it maps everything.
+
+## Start here
+
+- [Agent instructions](AGENTS.md): how an agent session should behave in this Vault
+- [Vault index](index.md): the root directory listing with the OKF version declaration
+
+## Concepts
+
+- [0-Projects index](0-Projects/index.md): active efforts, each its own subdirectory
+- [1-Areas index](1-Areas/index.md): ongoing responsibilities
+- [2-Resources index](2-Resources/index.md): atomic Ideas and topic Structure Notes
+- [3-Archives index](3-Archives/index.md): retired material
+
+## Conventions
+
+- [Update log](log.md): append an entry for every significant Vault change; most recent date first
+
+## Optional
+
+- [Type registry](2-Resources/vocabulary.md): the governed `type` vocabulary and its add-a-type flow
